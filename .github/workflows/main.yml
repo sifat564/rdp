@@ -1,0 +1,135 @@
+name: RDP (Direct Access)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core Windows RDP
+        run: |
+          # 1. Enable Remote Desktop (Negotiate Mode for Windows 10/11 mstsc compatibility)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value 3389 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fInheritColorDepth" -Value 0 -Force
+
+          # 2. Disable Windows Defender Firewall across all network adapters (including Tailscale adapter)
+          netsh advfirewall set allprofiles state off
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          # 3. Restart TermService
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          # Compliant password (Uppercase + Lowercase + Numbers + Symbols, NO username substrings)
+          $password = "SecretPass@" + (Get-Random -Minimum 100000 -Maximum 999999) + "#Wk"
+          
+          # Delete if exists, then create with net user
+          net user RDP /delete 2>$null
+          net user RDP "$password" /add /y /expires:never
+          net localgroup administrators RDP /add
+          net localgroup "Remote Desktop Users" RDP /add
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Setup Multi-Channel Direct Tunnel
+        run: |
+          # Channel 1: Pinggy SSH Port 443 (Standard SSL Port - Works on all ISPs)
+          $pinggyLog = "$env:TEMP\pinggy.log"
+          Start-Process "ssh" -ArgumentList "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30", "-p", "443", "-R", "0:localhost:3389", "a.pinggy.io" -RedirectStandardOutput $pinggyLog -RedirectStandardError "$env:TEMP\pinggy_err.log" -NoNewWindow
+          
+          # Channel 2: Tailscale (Registers machine in Tailscale Dashboard)
+          $tailscaleKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if ($tailscaleKey -and $tailscaleKey.Trim() -ne "") {
+              try {
+                  Write-Host "Installing Tailscale..."
+                  Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale.exe"
+                  Start-Process -FilePath "$env:TEMP\tailscale.exe" -ArgumentList "/quiet", "/norestart" -Wait
+                  Start-Sleep -Seconds 4
+                  
+                  # Start Tailscale service if not running
+                  Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue | Start-Service
+                  
+                  $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+                  if (Test-Path $tsExe) {
+                      & $tsExe up --authkey=$tailscaleKey --hostname="github-rdp" --unattended --accept-routes
+                      Start-Sleep -Seconds 4
+                      $tsRaw = (& $tsExe ip -4 2>$null)
+                      if ($tsRaw) {
+                          $tsIp = ("$tsRaw").Trim()
+                          if ($tsIp -match "^\d+\.\d+\.\d+\.\d+$") {
+                              Write-Host "Tailscale machine registered! IP: $tsIp"
+                              echo "TAILSCALE_IP=$tsIp" >> $env:GITHUB_ENV
+                          }
+                      }
+                  }
+              } catch {
+                  Write-Host "Tailscale setup notice: $_"
+              }
+          }
+
+          # Channel 3: Bore Tunnel
+          $boreLog = "$env:TEMP\bore.log"
+          try {
+              Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\bore.zip"
+              Expand-Archive -Path "$env:TEMP\bore.zip" -DestinationPath "C:\bore" -Force
+              Start-Process "C:\bore\bore.exe" -ArgumentList "local 3389 --to bore.pub" -RedirectStandardOutput $boreLog -RedirectStandardError "$env:TEMP\bore_err.log" -NoNewWindow
+          } catch {}
+
+          # Wait up to 15s to capture endpoints
+          Start-Sleep -Seconds 8
+          $pinggyEp = ""
+          $boreEp = ""
+
+          for ($i = 0; $i -lt 12; $i++) {
+              if (Test-Path $pinggyLog) {
+                  $pTxt = Get-Content $pinggyLog -Raw
+                  if ($pTxt -match "([a-zA-Z0-9\.\-]+\.pinggy\.(?:link|io):\d+|tcp://[a-zA-Z0-9\.\-]+:\d+)") {
+                      $pinggyEp = ($matches[1] -replace "tcp://", "").Trim()
+                  }
+              }
+              if (Test-Path $boreLog) {
+                  $bTxt = Get-Content $boreLog -Raw
+                  if ($bTxt -match "listening at (bore\.pub:\d+)") {
+                      $boreEp = $matches[1].Trim()
+                  }
+              }
+              if ($pinggyEp -or $boreEp) { break }
+              Start-Sleep -Seconds 2
+          }
+
+          echo "PINGGY_ENDPOINT=$pinggyEp" >> $env:GITHUB_ENV
+          echo "BORE_ENDPOINT=$boreEp" >> $env:GITHUB_ENV
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=================================================="
+          Write-Host "🚀 RDP ACCESS CHANNELS READY"
+          Write-Host "=================================================="
+          if ($env:PINGGY_ENDPOINT) {
+              Write-Host "🌐 Method 1 (Pinggy Direct):  $env:PINGGY_ENDPOINT"
+          }
+          if ($env:BORE_ENDPOINT) {
+              Write-Host "🌐 Method 2 (Bore Direct):    $env:BORE_ENDPOINT"
+          }
+          if ($env:TAILSCALE_IP) {
+              Write-Host "🔒 Method 3 (Tailscale IP):   $env:TAILSCALE_IP"
+          }
+          Write-Host "--------------------------------------------------"
+          Write-Host "👤 Username:   RDP"
+          Write-Host "🔑 Password:   $env:RDP_PASSWORD"
+          Write-Host "==================================================`n"
+          Write-Host "👉 আপনার উইন্ডোজ পিসিতে 'Remote Desktop Connection' (mstsc) ওপেন করে উপরের যেকোনো একটি Computer IP দিয়ে কানেক্ট করুন!`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Session is Active..."
+              Start-Sleep -Seconds 300
+          }
